@@ -412,7 +412,20 @@ def load_model_and_tokenizer(model_name: str, device_pref: str, dtype_pref: str)
     else:
         dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype_pref]
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    # model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+    # Force attention weights to be materialized (otherwise out.attentions may contain None)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+            attn_implementation="eager",
+        )
+    except TypeError:
+        # Older transformers doesn't accept attn_implementation kwarg
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype)
+        if hasattr(model.config, "attn_implementation"):
+            model.config.attn_implementation = "eager"
+
     model.to(device)
     model.eval()
 
