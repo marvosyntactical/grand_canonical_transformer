@@ -3,7 +3,7 @@ import json
 import math
 import time
 import hashlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -20,24 +20,32 @@ from argos_viz import (
 PRECOMPUTED_DIR = "precomputed"
 
 
-def patch_gpt2_style_attn_scores(model) -> Dict[str, Any]:
-    patched_modules = 0
+# ---------------------------
+# Score capture (robust)
+# ---------------------------
+
+def _try_patch__attn_method(model) -> Dict[str, Any]:
+    """Old-style: patch modules that expose a private _attn(query,key,value,...)"""
+    patched = 0
     for m in model.modules():
-        if not hasattr(m, "_attn") or not callable(getattr(m, "_attn", None)):
+        if not hasattr(m, "_attn") or not callable(getattr(m, "_attn")):
             continue
-        if hasattr(m, "_gce_is_patched") and m._gce_is_patched:
+        if getattr(m, "_gce_is_patched", False):
             continue
+        orig = m._attn
 
-        orig__attn = m._attn
-
-        def make_new__attn(attn_module, orig_fn):
+        def make_new(attn_module, orig_fn):
             def new__attn(query, key, value, attention_mask=None, head_mask=None):
+                # raw scores
                 scores = torch.matmul(query, key.transpose(-1, -2))  # [B,H,T,T]
+                # optional scaling (varies across versions)
                 if getattr(attn_module, "scale_attn_weights", False):
                     scores = scores / math.sqrt(value.size(-1))
+                # causal mask if present
                 if hasattr(attn_module, "bias") and attn_module.bias is not None:
                     causal_mask = attn_module.bias[:, :, : scores.size(-2), : scores.size(-1)]
                     scores = torch.where(causal_mask, scores, torch.full_like(scores, -1e4))
+                # attention mask (already additive)
                 if attention_mask is not None:
                     scores = scores + attention_mask
                 attn_module._gce_scores = scores.detach()
@@ -45,28 +53,129 @@ def patch_gpt2_style_attn_scores(model) -> Dict[str, Any]:
 
             return new__attn
 
-        m._attn = make_new__attn(m, orig__attn)
+        m._attn = make_new(m, orig)
         m._gce_is_patched = True
-        patched_modules += 1
+        patched += 1
 
-    return {"patched": patched_modules > 0, "method": "gpt2_style__attn_patch", "patched_modules": patched_modules}
+    return {"patched": patched > 0, "method": "patch__attn", "patched_modules": patched}
+
+
+def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
+    """
+    Patch GPT2Attention.forward directly. This is the robust path for distilgpt2 / gpt2.
+
+    We compute scores from q,k right before softmax and stash them as _gce_scores on the module.
+    """
+    try:
+        from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
+    except Exception as e:
+        return {"patched": False, "method": "patch_gpt2_forward", "patched_modules": 0, "error": str(e)}
+
+    patched = 0
+
+    for m in model.modules():
+        if not isinstance(m, GPT2Attention):
+            continue
+        if getattr(m, "_gce_is_patched", False):
+            continue
+
+        orig_forward = m.forward
+
+        def make_new_forward(attn_module, orig_fwd):
+            def new_forward(
+                hidden_states,
+                layer_past=None,
+                attention_mask=None,
+                head_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                use_cache=False,
+                output_attentions=False,
+            ):
+                # Call original forward, but recompute scores in a side pass.
+                # We must reproduce q,k the same way GPT2Attention does.
+                # This is stable across GPT2Attention versions: it always has c_attn and split_heads.
+                with torch.no_grad():
+                    # This follows the canonical GPT2Attention pattern:
+                    # qkv = c_attn(hidden_states) -> split into q,k,v -> split_heads
+                    qkv = attn_module.c_attn(hidden_states)
+                    query, key, value = qkv.split(attn_module.split_size, dim=2)
+
+                    query = attn_module._split_heads(query, attn_module.num_heads, attn_module.head_dim)
+                    key = attn_module._split_heads(key, attn_module.num_heads, attn_module.head_dim)
+                    value = attn_module._split_heads(value, attn_module.num_heads, attn_module.head_dim)
+
+                    # incorporate past if any (matches GPT2 cache semantics)
+                    if layer_past is not None:
+                        past_key, past_value = layer_past
+                        key = torch.cat((past_key, key), dim=-2)
+                        value = torch.cat((past_value, value), dim=-2)
+
+                    # raw scores
+                    scores = torch.matmul(query, key.transpose(-1, -2))  # [B,H,T,Tpast]
+                    # scaling
+                    scores = scores / math.sqrt(value.size(-1))
+
+                    # causal mask via attn_module.bias if present
+                    if hasattr(attn_module, "bias") and attn_module.bias is not None:
+                        qlen = scores.size(-2)
+                        klen = scores.size(-1)
+                        causal_mask = attn_module.bias[:, :, klen - qlen : klen, :klen]
+                        scores = torch.where(causal_mask, scores, torch.full_like(scores, -1e4))
+
+                    # attention mask (additive)
+                    if attention_mask is not None:
+                        scores = scores + attention_mask
+
+                    attn_module._gce_scores = scores.detach()
+
+                return orig_fwd(
+                    hidden_states,
+                    layer_past=layer_past,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                )
+
+            return new_forward
+
+        m.forward = make_new_forward(m, orig_forward)
+        m._gce_is_patched = True
+        patched += 1
+
+    return {"patched": patched > 0, "method": "patch_gpt2_forward", "patched_modules": patched}
 
 
 def install_score_capture(model) -> Dict[str, Any]:
-    return patch_gpt2_style_attn_scores(model)
+    """
+    Try multiple patch strategies; return the best that worked.
+    """
+    info = _try_patch__attn_method(model)
+    if info.get("patched"):
+        return info
+    info2 = _try_patch_gpt2attention_forward(model)
+    if info2.get("patched"):
+        return info2
+    return info2  # best failure info
 
 
-def collect_patched_scores(model) -> List[torch.Tensor]:
-    scores = []
+def collect_scores(model) -> List[torch.Tensor]:
+    out = []
     for m in model.modules():
         if hasattr(m, "_gce_scores") and isinstance(m._gce_scores, torch.Tensor):
-            scores.append(m._gce_scores)
-    return scores
+            out.append(m._gce_scores)
+    return out
 
+
+# ---------------------------
+# Cache IO
+# ---------------------------
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
-
 
 def seq_hash(model_name: str, ids: torch.Tensor) -> str:
     h = hashlib.sha1()
@@ -74,7 +183,6 @@ def seq_hash(model_name: str, ids: torch.Tensor) -> str:
     h.update(b"\0")
     h.update(np.asarray(ids.detach().cpu(), dtype=np.int64).tobytes())
     return h.hexdigest()[:16]
-
 
 def save_npz_cache(
     path: str,
@@ -149,7 +257,7 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # Force eager attention so attentions exist
+    # prefer eager attention
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, attn_implementation="eager")
     except TypeError:
@@ -161,12 +269,13 @@ def main():
 
     model.to(device)
     model.eval()
-    install_score_capture(model)
+
+    patch_info = install_score_capture(model)
 
     torch.manual_seed(args.seed)
 
     prompt_text = args.prompt.strip() + "\n"
-    inputs = tok(prompt_text, return_tensors="pt", padding=False).to(device)
+    inputs = tok(prompt_text, return_tensors="pt").to(device)
     input_len = int(inputs["input_ids"].shape[-1])
 
     with torch.no_grad():
@@ -187,6 +296,7 @@ def main():
     diag_input_ids = full_ids.unsqueeze(0).to(device)
     attention_mask = torch.ones_like(diag_input_ids)
 
+    # Clear any stale scores and run a full forward pass for attentions + scores
     for m in model.modules():
         if hasattr(m, "_gce_scores"):
             delattr(m, "_gce_scores")
@@ -203,9 +313,10 @@ def main():
     attentions = list(out.attentions) if out.attentions is not None else []
     attentions = [a for a in attentions if a is not None]
 
-    scores = collect_patched_scores(model)
+    scores = collect_scores(model)
     scores = scores if (len(scores) >= len(attentions) and len(attentions) > 0) else None
 
+    # PCA payload (optional)
     pca_payload: Dict[str, Any] = {}
     try:
         Z = capture_layernorm_flow(model, diag_input_ids, attention_mask=attention_mask)  # (T,Lnorm,D)
@@ -254,7 +365,7 @@ def main():
         "dtype": str(args.dtype),
         "device": str(device),
         "transformers_version": __import__("transformers").__version__,
-        "note": "precompute.py default run",
+        "score_capture": patch_info,
     }
 
     save_npz_cache(
@@ -270,6 +381,8 @@ def main():
     )
 
     print(f"Saved: {out_path}")
+    print(f"Score capture: {patch_info}")
+    print(f"Scores captured: {0 if scores is None else len(scores)}; attentions: {len(attentions)}")
 
 
 if __name__ == "__main__":
