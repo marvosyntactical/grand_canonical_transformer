@@ -3,7 +3,8 @@ import json
 import math
 import time
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple
+import inspect
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -20,36 +21,54 @@ from argos_viz import (
 PRECOMPUTED_DIR = "precomputed"
 
 
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
 # ---------------------------
-# Score capture (robust)
+# Robust patching utilities
 # ---------------------------
 
+def _filter_kwargs_for(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter kwargs to only those accepted by fn's signature (prevents unexpected kwarg crashes)."""
+    try:
+        sig = inspect.signature(fn)
+        allowed = set(sig.parameters.keys())
+        # If fn accepts **kwargs, keep everything
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        # If signature introspection fails, best effort: keep kwargs
+        return kwargs
+
+
 def _try_patch__attn_method(model) -> Dict[str, Any]:
-    """Old-style: patch modules that expose a private _attn(query,key,value,...)"""
     patched = 0
     for m in model.modules():
         if not hasattr(m, "_attn") or not callable(getattr(m, "_attn")):
             continue
         if getattr(m, "_gce_is_patched", False):
             continue
+
         orig = m._attn
 
         def make_new(attn_module, orig_fn):
-            def new__attn(query, key, value, attention_mask=None, head_mask=None):
-                # raw scores
+            def new__attn(query, key, value, attention_mask=None, head_mask=None, **kwargs):
                 scores = torch.matmul(query, key.transpose(-1, -2))  # [B,H,T,T]
-                # optional scaling (varies across versions)
                 if getattr(attn_module, "scale_attn_weights", False):
                     scores = scores / math.sqrt(value.size(-1))
-                # causal mask if present
+
                 if hasattr(attn_module, "bias") and attn_module.bias is not None:
                     causal_mask = attn_module.bias[:, :, : scores.size(-2), : scores.size(-1)]
                     scores = torch.where(causal_mask, scores, torch.full_like(scores, -1e4))
-                # attention mask (already additive)
+
                 if attention_mask is not None:
                     scores = scores + attention_mask
+
                 attn_module._gce_scores = scores.detach()
-                return orig_fn(query, key, value, attention_mask=attention_mask, head_mask=head_mask)
+                kw = _filter_kwargs_for(orig_fn, dict(kwargs))
+                return orig_fn(query, key, value, attention_mask=attention_mask, head_mask=head_mask, **kw)
 
             return new__attn
 
@@ -61,18 +80,12 @@ def _try_patch__attn_method(model) -> Dict[str, Any]:
 
 
 def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
-    """
-    Patch GPT2Attention.forward directly. This is the robust path for distilgpt2 / gpt2.
-
-    We compute scores from q,k right before softmax and stash them as _gce_scores on the module.
-    """
     try:
         from transformers.models.gpt2.modeling_gpt2 import GPT2Attention
     except Exception as e:
         return {"patched": False, "method": "patch_gpt2_forward", "patched_modules": 0, "error": str(e)}
 
     patched = 0
-
     for m in model.modules():
         if not isinstance(m, GPT2Attention):
             continue
@@ -82,22 +95,22 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
         orig_forward = m.forward
 
         def make_new_forward(attn_module, orig_fwd):
-            def new_forward(
-                hidden_states,
-                layer_past=None,
-                attention_mask=None,
-                head_mask=None,
-                encoder_hidden_states=None,
-                encoder_attention_mask=None,
-                use_cache=False,
-                output_attentions=False,
-            ):
-                # Call original forward, but recompute scores in a side pass.
-                # We must reproduce q,k the same way GPT2Attention does.
-                # This is stable across GPT2Attention versions: it always has c_attn and split_heads.
+            def new_forward(*args, **kwargs):
+                # Support both old and new naming for cached keys/values
+                if "past_key_values" in kwargs and "layer_past" not in kwargs:
+                    kwargs["layer_past"] = kwargs["past_key_values"]
+
+                # hidden_states is first positional arg after self in GPT2Attention.forward
+                hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states", None)
+                if hidden_states is None:
+                    # fall back to original (should not happen)
+                    kw = _filter_kwargs_for(orig_fwd, dict(kwargs))
+                    return orig_fwd(*args, **kw)
+
+                layer_past = kwargs.get("layer_past", None)
+                attention_mask = kwargs.get("attention_mask", None)
+
                 with torch.no_grad():
-                    # This follows the canonical GPT2Attention pattern:
-                    # qkv = c_attn(hidden_states) -> split into q,k,v -> split_heads
                     qkv = attn_module.c_attn(hidden_states)
                     query, key, value = qkv.split(attn_module.split_size, dim=2)
 
@@ -105,40 +118,33 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
                     key = attn_module._split_heads(key, attn_module.num_heads, attn_module.head_dim)
                     value = attn_module._split_heads(value, attn_module.num_heads, attn_module.head_dim)
 
-                    # incorporate past if any (matches GPT2 cache semantics)
                     if layer_past is not None:
                         past_key, past_value = layer_past
                         key = torch.cat((past_key, key), dim=-2)
                         value = torch.cat((past_value, value), dim=-2)
 
-                    # raw scores
-                    scores = torch.matmul(query, key.transpose(-1, -2))  # [B,H,T,Tpast]
-                    # scaling
+                    scores = torch.matmul(query, key.transpose(-1, -2))
                     scores = scores / math.sqrt(value.size(-1))
 
-                    # causal mask via attn_module.bias if present
                     if hasattr(attn_module, "bias") and attn_module.bias is not None:
                         qlen = scores.size(-2)
                         klen = scores.size(-1)
                         causal_mask = attn_module.bias[:, :, klen - qlen : klen, :klen]
                         scores = torch.where(causal_mask, scores, torch.full_like(scores, -1e4))
 
-                    # attention mask (additive)
                     if attention_mask is not None:
                         scores = scores + attention_mask
 
                     attn_module._gce_scores = scores.detach()
 
-                return orig_fwd(
-                    hidden_states,
-                    layer_past=layer_past,
-                    attention_mask=attention_mask,
-                    head_mask=head_mask,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                )
+                # Don't forward unexpected kwargs to the original implementation.
+                # In particular, remove past_key_values if orig doesn't accept it.
+                cleaned = dict(kwargs)
+                if "past_key_values" in cleaned:
+                    # keep it only if accepted
+                    pass
+                kw = _filter_kwargs_for(orig_fwd, cleaned)
+                return orig_fwd(*args, **kw)
 
             return new_forward
 
@@ -150,16 +156,11 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
 
 
 def install_score_capture(model) -> Dict[str, Any]:
-    """
-    Try multiple patch strategies; return the best that worked.
-    """
     info = _try_patch__attn_method(model)
     if info.get("patched"):
         return info
     info2 = _try_patch_gpt2attention_forward(model)
-    if info2.get("patched"):
-        return info2
-    return info2  # best failure info
+    return info2
 
 
 def collect_scores(model) -> List[torch.Tensor]:
@@ -171,11 +172,8 @@ def collect_scores(model) -> List[torch.Tensor]:
 
 
 # ---------------------------
-# Cache IO
+# Cache naming & IO
 # ---------------------------
-
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
 
 def seq_hash(model_name: str, ids: torch.Tensor) -> str:
     h = hashlib.sha1()
@@ -183,6 +181,7 @@ def seq_hash(model_name: str, ids: torch.Tensor) -> str:
     h.update(b"\0")
     h.update(np.asarray(ids.detach().cpu(), dtype=np.int64).tobytes())
     return h.hexdigest()[:16]
+
 
 def save_npz_cache(
     path: str,
@@ -213,8 +212,8 @@ def save_npz_cache(
             data[f"score_{i}"] = s.detach().cpu().to(torch.float16).numpy()
 
     if pca_payload and "X3" in pca_payload:
-        data["pca_X3"] = np.asarray(pca_payload["X3"], dtype=np.float16)  # (T,Lnorm,3)
-        data["pca_Lnorm"] = np.array(int(pca_payload.get("Lnorm", pca_payload["X3"].shape[1])), dtype=np.int64)
+        data["pca_X3"] = np.asarray(pca_payload["X3"], dtype=np.float16)
+        data["pca_Lnorm"] = np.array(int(pca_payload["X3"].shape[1]), dtype=np.int64)
         data["pca_tokens_json"] = np.array(json.dumps(pca_payload.get("tokens", [])))
         data["pca_colors_json"] = np.array(json.dumps(pca_payload.get("colors", [])))
         eigvals_by_ln = pca_payload.get("eigvals_by_ln", [])
@@ -257,15 +256,12 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # prefer eager attention
     try:
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype, attn_implementation="eager")
     except TypeError:
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
         if hasattr(model.config, "attn_implementation"):
             model.config.attn_implementation = "eager"
-    if hasattr(model.config, "attn_implementation"):
-        model.config.attn_implementation = "eager"
 
     model.to(device)
     model.eval()
@@ -293,10 +289,10 @@ def main():
     new_ids = full_ids[input_len:]
     assistant_text = tok.decode(new_ids, skip_special_tokens=True).strip()
 
+    # Now do a full forward pass for attentions + scores
     diag_input_ids = full_ids.unsqueeze(0).to(device)
     attention_mask = torch.ones_like(diag_input_ids)
 
-    # Clear any stale scores and run a full forward pass for attentions + scores
     for m in model.modules():
         if hasattr(m, "_gce_scores"):
             delattr(m, "_gce_scores")
@@ -310,13 +306,11 @@ def main():
             return_dict=True,
         )
 
-    attentions = list(out.attentions) if out.attentions is not None else []
-    attentions = [a for a in attentions if a is not None]
-
+    attentions = [a for a in (out.attentions or []) if a is not None]
     scores = collect_scores(model)
-    scores = scores if (len(scores) >= len(attentions) and len(attentions) > 0) else None
+    scores = scores if (len(attentions) > 0 and len(scores) >= len(attentions)) else None
 
-    # PCA payload (optional)
+    # PCA payload
     pca_payload: Dict[str, Any] = {}
     try:
         Z = capture_layernorm_flow(model, diag_input_ids, attention_mask=attention_mask)  # (T,Lnorm,D)
@@ -342,7 +336,6 @@ def main():
             "X3": X3,
             "tokens": tokens,
             "colors": colors,
-            "Lnorm": int(Lnorm),
             "eigvals_by_ln": eigvals_by_ln,
         }
     except Exception as e:
