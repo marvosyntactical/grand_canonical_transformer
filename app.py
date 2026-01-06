@@ -354,8 +354,8 @@ def build_prompt_qa(messages: List[Dict[str, str]]) -> str:
 # Streamlit UI
 # -----------------------------
 
-st.set_page_config(page_title="The Transformer as Grand Canonical Ensemble.", layout="wide")
-st.title("The Transformer as Grand Canonical Ensemble.")
+st.set_page_config(page_title="The Transformer as Grand Canonical Ensemble", layout="wide")
+st.title("The Transformer as Grand Canonical Ensemble")
 st.caption("Chat with a HuggingFace causal LM and visualize GCE-style diagnostics + post-LN latent geometry.")
 
 # Icon send button styling
