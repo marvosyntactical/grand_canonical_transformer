@@ -16,4 +16,5 @@ COPY . /app
 ENV STREAMLIT_SERVER_PORT=8501
 EXPOSE 8501
 
+CMD ["python3", "precompute.py", "--model", "distilgpt2", "--prompt", "'Hey, how are ya?'", "--max_new_tokens", "64"]
 CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
