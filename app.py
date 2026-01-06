@@ -180,7 +180,9 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
                     value = _split_heads_fallback(attn_module, value)
 
                     if layer_past is not None:
-                        past_key, past_value = layer_past
+                        # past_key, past_value = layer_past
+                        past_key = layer_past[0]
+                        past_value = layer_past[1]
                         key = torch.cat((past_key, key), dim=-2)
                         value = torch.cat((past_value, value), dim=-2)
 
