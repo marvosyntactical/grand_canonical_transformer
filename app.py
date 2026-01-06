@@ -427,7 +427,7 @@ with st.sidebar:
     dtype_pref = st.selectbox("dtype", ["auto", "float16", "bfloat16", "float32"], index=0)
 
     st.header("Generation")
-    prompt_style = st.selectbox("Prompt style", ["Q/A few-shot (recommended for distilgpt2)", "Plain continuation"], index=0)
+    prompt_style = st.selectbox("Prompt style", ["Q/A few-shot (recommended for distilgpt2)", "Plain continuation"], index=1)
     max_new_tokens = st.slider("max_new_tokens", 1, 256, 64, 1)
     temperature = st.slider("temperature", 0.1, 2.0, 0.8, 0.1)
     top_p = st.slider("top_p", 0.1, 1.0, 0.95, 0.05)
@@ -676,7 +676,7 @@ if submitted:
                 diag = compute_diagnostics_for_sequence(full_ids, input_len)
 
                 status.update(label="Done", state="complete")
-                st.markdown(assistant_text if assistant_text else "*[empty completion]*")
+                # st.markdown(assistant_text if assistant_text else "*[empty completion]*")
 
                 st.session_state.messages.append({"role": "assistant", "content": assistant_text})
                 st.session_state.diag = diag
