@@ -22,10 +22,6 @@ from argos_viz import (
 PRECOMPUTED_DIR = "precomputed"
 
 
-# ---------------------------
-# Helpers: kwargs filtering
-# ---------------------------
-
 def _filter_kwargs_for(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     try:
         sig = inspect.signature(fn)
@@ -37,33 +33,31 @@ def _filter_kwargs_for(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         return kwargs
 
 
-# ---------------------------
-# Numerics
-# ---------------------------
+def _split_heads_fallback(attn_module, x: torch.Tensor) -> torch.Tensor:
+    if hasattr(attn_module, "_split_heads") and callable(getattr(attn_module, "_split_heads")):
+        return attn_module._split_heads(x, attn_module.num_heads, attn_module.head_dim)
+    if hasattr(attn_module, "split_heads") and callable(getattr(attn_module, "split_heads")):
+        return attn_module.split_heads(x)
 
-def safe_entropy(p: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    p = p.float().clamp(eps, 1.0)
-    return -(p * torch.log(p)).sum(dim=-1)
+    B, T, D = x.shape
+    n_head = getattr(attn_module, "num_heads", None)
+    if n_head is None:
+        n_head = getattr(attn_module, "n_head", None)
+    if n_head is None:
+        raise AttributeError("Cannot infer num_heads / n_head for GPT2Attention split.")
 
-def topk_mass(p: torch.Tensor, k: int) -> torch.Tensor:
-    k = min(int(k), p.shape[-1])
-    vals, _ = torch.topk(p.float(), k=k, dim=-1)
-    return vals.sum(dim=-1)
+    head_dim = getattr(attn_module, "head_dim", None)
+    if head_dim is None:
+        head_dim = getattr(attn_module, "head_size", None)
+    if head_dim is None:
+        split_size = getattr(attn_module, "split_size", None)
+        if split_size is not None:
+            head_dim = int(split_size // n_head)
+        else:
+            head_dim = int(D // n_head)
 
-def softmax_beta(scores: torch.Tensor, beta: float) -> torch.Tensor:
-    return torch.softmax((beta * scores).float(), dim=-1)
+    return x.view(B, T, n_head, head_dim).permute(0, 2, 1, 3).contiguous()
 
-def var_under(p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    p = p.float()
-    x = x.float()
-    m = (p * x).sum(dim=-1)
-    m2 = (p * (x * x)).sum(dim=-1)
-    return m2 - m * m
-
-
-# ---------------------------
-# Score capture
-# ---------------------------
 
 def _try_patch__attn_method(model) -> Dict[str, Any]:
     patched = 0
@@ -119,7 +113,6 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
 
         def make_new_forward(attn_module, orig_fwd):
             def new_forward(*args, **kwargs):
-                # new HF stack sometimes uses past_key_values for attention modules
                 if "past_key_values" in kwargs and "layer_past" not in kwargs:
                     kwargs["layer_past"] = kwargs["past_key_values"]
 
@@ -133,11 +126,15 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
 
                 with torch.no_grad():
                     qkv = attn_module.c_attn(hidden_states)
-                    query, key, value = qkv.split(attn_module.split_size, dim=2)
+                    split_size = getattr(attn_module, "split_size", None)
+                    if split_size is None:
+                        query, key, value = qkv.chunk(3, dim=2)
+                    else:
+                        query, key, value = qkv.split(split_size, dim=2)
 
-                    query = attn_module._split_heads(query, attn_module.num_heads, attn_module.head_dim)
-                    key = attn_module._split_heads(key, attn_module.num_heads, attn_module.head_dim)
-                    value = attn_module._split_heads(value, attn_module.num_heads, attn_module.head_dim)
+                    query = _split_heads_fallback(attn_module, query)
+                    key = _split_heads_fallback(attn_module, key)
+                    value = _split_heads_fallback(attn_module, value)
 
                     if layer_past is not None:
                         past_key, past_value = layer_past

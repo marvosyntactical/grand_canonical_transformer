@@ -33,14 +33,45 @@ def _filter_kwargs_for(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """Filter kwargs to only those accepted by fn's signature (prevents unexpected kwarg crashes)."""
     try:
         sig = inspect.signature(fn)
-        allowed = set(sig.parameters.keys())
-        # If fn accepts **kwargs, keep everything
         if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
             return kwargs
+        allowed = set(sig.parameters.keys())
         return {k: v for k, v in kwargs.items() if k in allowed}
     except Exception:
-        # If signature introspection fails, best effort: keep kwargs
         return kwargs
+
+
+def _split_heads_fallback(attn_module, x: torch.Tensor) -> torch.Tensor:
+    """
+    x: [B, T, D] -> [B, H, T, Dh]
+    Tries module helpers first; otherwise uses manual reshape.
+    """
+    if hasattr(attn_module, "_split_heads") and callable(getattr(attn_module, "_split_heads")):
+        # older HF
+        return attn_module._split_heads(x, attn_module.num_heads, attn_module.head_dim)
+    if hasattr(attn_module, "split_heads") and callable(getattr(attn_module, "split_heads")):
+        # some HF versions
+        return attn_module.split_heads(x)
+
+    B, T, D = x.shape
+    n_head = getattr(attn_module, "num_heads", None)
+    if n_head is None:
+        n_head = getattr(attn_module, "n_head", None)
+    if n_head is None:
+        raise AttributeError("Cannot infer num_heads / n_head for GPT2Attention split.")
+
+    head_dim = getattr(attn_module, "head_dim", None)
+    if head_dim is None:
+        head_dim = getattr(attn_module, "head_size", None)
+    if head_dim is None:
+        split_size = getattr(attn_module, "split_size", None)
+        if split_size is not None:
+            head_dim = int(split_size // n_head)
+        else:
+            head_dim = int(D // n_head)
+
+    x = x.view(B, T, n_head, head_dim).permute(0, 2, 1, 3).contiguous()
+    return x
 
 
 def _try_patch__attn_method(model) -> Dict[str, Any]:
@@ -100,10 +131,8 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
                 if "past_key_values" in kwargs and "layer_past" not in kwargs:
                     kwargs["layer_past"] = kwargs["past_key_values"]
 
-                # hidden_states is first positional arg after self in GPT2Attention.forward
                 hidden_states = args[0] if len(args) > 0 else kwargs.get("hidden_states", None)
                 if hidden_states is None:
-                    # fall back to original (should not happen)
                     kw = _filter_kwargs_for(orig_fwd, dict(kwargs))
                     return orig_fwd(*args, **kw)
 
@@ -112,11 +141,16 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
 
                 with torch.no_grad():
                     qkv = attn_module.c_attn(hidden_states)
-                    query, key, value = qkv.split(attn_module.split_size, dim=2)
+                    split_size = getattr(attn_module, "split_size", None)
+                    if split_size is None:
+                        # fallback: split into 3 equal chunks
+                        query, key, value = qkv.chunk(3, dim=2)
+                    else:
+                        query, key, value = qkv.split(split_size, dim=2)
 
-                    query = attn_module._split_heads(query, attn_module.num_heads, attn_module.head_dim)
-                    key = attn_module._split_heads(key, attn_module.num_heads, attn_module.head_dim)
-                    value = attn_module._split_heads(value, attn_module.num_heads, attn_module.head_dim)
+                    query = _split_heads_fallback(attn_module, query)
+                    key = _split_heads_fallback(attn_module, key)
+                    value = _split_heads_fallback(attn_module, value)
 
                     if layer_past is not None:
                         past_key, past_value = layer_past
@@ -137,12 +171,7 @@ def _try_patch_gpt2attention_forward(model) -> Dict[str, Any]:
 
                     attn_module._gce_scores = scores.detach()
 
-                # Don't forward unexpected kwargs to the original implementation.
-                # In particular, remove past_key_values if orig doesn't accept it.
                 cleaned = dict(kwargs)
-                if "past_key_values" in cleaned:
-                    # keep it only if accepted
-                    pass
                 kw = _filter_kwargs_for(orig_fwd, cleaned)
                 return orig_fwd(*args, **kw)
 
@@ -159,8 +188,7 @@ def install_score_capture(model) -> Dict[str, Any]:
     info = _try_patch__attn_method(model)
     if info.get("patched"):
         return info
-    info2 = _try_patch_gpt2attention_forward(model)
-    return info2
+    return _try_patch_gpt2attention_forward(model)
 
 
 def collect_scores(model) -> List[torch.Tensor]:
@@ -289,7 +317,6 @@ def main():
     new_ids = full_ids[input_len:]
     assistant_text = tok.decode(new_ids, skip_special_tokens=True).strip()
 
-    # Now do a full forward pass for attentions + scores
     diag_input_ids = full_ids.unsqueeze(0).to(device)
     attention_mask = torch.ones_like(diag_input_ids)
 
@@ -310,7 +337,6 @@ def main():
     scores = collect_scores(model)
     scores = scores if (len(attentions) > 0 and len(scores) >= len(attentions)) else None
 
-    # PCA payload
     pca_payload: Dict[str, Any] = {}
     try:
         Z = capture_layernorm_flow(model, diag_input_ids, attention_mask=attention_mask)  # (T,Lnorm,D)
