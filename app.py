@@ -22,6 +22,49 @@ from argos_viz import (
 PRECOMPUTED_DIR = "precomputed"
 
 
+# ---------------------------
+# Helpers: kwargs filtering
+# ---------------------------
+
+def _filter_kwargs_for(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        sig = inspect.signature(fn)
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return kwargs
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        return kwargs
+
+
+# ---------------------------
+# Numerics
+# ---------------------------
+
+def safe_entropy(p: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    p = p.float().clamp(eps, 1.0)
+    return -(p * torch.log(p)).sum(dim=-1)
+
+def topk_mass(p: torch.Tensor, k: int) -> torch.Tensor:
+    k = min(int(k), p.shape[-1])
+    vals, _ = torch.topk(p.float(), k=k, dim=-1)
+    return vals.sum(dim=-1)
+
+def softmax_beta(scores: torch.Tensor, beta: float) -> torch.Tensor:
+    return torch.softmax((beta * scores).float(), dim=-1)
+
+def var_under(p: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    p = p.float()
+    x = x.float()
+    m = (p * x).sum(dim=-1)
+    m2 = (p * (x * x)).sum(dim=-1)
+    return m2 - m * m
+
+
+# ---------------------------
+# Score capture
+# ---------------------------
+
 def _filter_kwargs_for(fn, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     try:
         sig = inspect.signature(fn)
@@ -181,7 +224,6 @@ def collect_scores(model) -> List[torch.Tensor]:
         if hasattr(m, "_gce_scores") and isinstance(m._gce_scores, torch.Tensor):
             out.append(m._gce_scores)
     return out
-
 
 # ---------------------------
 # Precomputed cache loading (read-only)
@@ -593,13 +635,8 @@ def compute_diagnostics_for_sequence(full_ids_1d: torch.Tensor, input_len: int) 
 # Chat rendering (input LAST)
 # =========================
 
-st.markdown("### Chat")
-for m in st.session_state.messages[1:]:
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
 with st.form("chat_form", clear_on_submit=True):
-    user_text = st.text_input("Message", value="", placeholder="Type a message…", label_visibility="collapsed")
+    user_text = st.text_input("Message", value="", placeholder="Type a message…", label_visibility="collapsed", width=1000)
     submitted = st.form_submit_button("➤", type="primary")
 
 if submitted:
@@ -610,10 +647,10 @@ if submitted:
         with st.chat_message("assistant"):
             status = st.status("Generating…", expanded=True)
             try:
-                status.write("Building prompt…")
+                # status.write("Building prompt…")
                 prompt_text = build_prompt_qa(st.session_state.messages) if prompt_style.startswith("Q/A") else build_prompt_plain(st.session_state.messages)
 
-                status.write("Tokenizing…")
+                # status.write("Tokenizing…")
                 inputs = tokenizer(prompt_text, return_tensors="pt", padding=False).to(device)
                 input_len = int(inputs["input_ids"].shape[-1])
 
@@ -647,6 +684,12 @@ if submitted:
             except Exception as e:
                 status.update(label="Generation failed", state="error")
                 st.exception(e)
+
+st.markdown("### Chat")
+for m in st.session_state.messages[1:]:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
 
 
 # =========================

@@ -32,6 +32,57 @@ import plotly.graph_objects as go
 
 import colorsys
 
+import unicodedata
+
+# ------------------------- Text sanitization -------------------------
+
+def remove_letters_with_diacritics(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    s = s.replace("Ġ", " ").replace("▁", " ")
+    out = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if len(ch) == 1:  # Ensure it's a single character
+            try:
+                decomp = unicodedata.normalize("NFD", ch)
+                # Skip characters with diacritics (category 'Mn' is for marks)
+                if any(unicodedata.category(c) == "Mn" for c in decomp[1:]):
+                    i += 1
+                    continue
+            except (TypeError, ValueError):
+                # Skip any invalid characters and move to the next one
+                i += 1
+                continue
+        if i + 1 < len(s):
+            nxt = unicodedata.normalize("NFD", s[i + 1])
+            if any(unicodedata.category(c) == "Mn" for c in nxt):
+                i += 2
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out).encode("ascii", "ignore").decode("ascii")
+
+def sanitize_tokens(tokens):
+    return [remove_letters_with_diacritics(t) for t in tokens]
+
+def sanitize_figure_text(fig: go.Figure):
+    def fix(tr):
+        if hasattr(tr, "text") and tr.text is not None:
+            if isinstance(tr.text, (list, tuple)):
+                tr.text = [remove_letters_with_diacritics(x) for x in tr.text]
+            else:
+                tr.text = remove_letters_with_diacritics(tr.text)
+    for tr in fig.data:
+        fix(tr)
+    if fig.frames:
+        for fr in fig.frames:
+            for tr in fr.data:
+                fix(tr)
+    return fig
+
+
 def color_gradient(n: int, span: int = 1024):
     """
     Smooth HSV gradient across 'span' positions (default 1024).
@@ -251,7 +302,7 @@ def build_layer_slider_figure(
     )
 
     fig = go.Figure(data=frames[0].data, frames=frames, layout=layout)
-    return fig
+    return sanitize_figure_text(fig)
 
 
 # ---------------------- High-level run for one step ----------------------
